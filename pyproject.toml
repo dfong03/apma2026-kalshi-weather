@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apma2026-kalshi-weather"
+version = "0.1.0"
+description = "Inventory-aware market making on Kalshi's daily high-temperature contracts: the replay and the live trader"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=50.0.2",
+    "httpx>=0.28.1",
+    "numpy>=2.5.3",
+    "scipy>=1.18.1",
+]
+
+[project.scripts]
+kalshi-weather = "kalshi_weather.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kalshi_weather"]

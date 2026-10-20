@@ -1,0 +1,189 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kalshi Weather Desk</title>
+<style>
+:root { --bg: #fff; --fg: #000; --dim: #666; --shade: #eee; --bid: #0044cc; --ask: #cc4400; --ok: #007a33; --hold: #996600; --stop: #cc0000; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000; --fg: #fff; --dim: #aaa; --shade: #222; --bid: #77aaff; --ask: #ff9966; --ok: #55dd88; --hold: #ffcc44; --stop: #ff6666; color-scheme: dark; } }
+:root[data-theme="dark"] { --bg: #000; --fg: #fff; --dim: #aaa; --shade: #222; --bid: #77aaff; --ask: #ff9966; --ok: #55dd88; --hold: #ffcc44; --stop: #ff6666; color-scheme: dark; }
+body { background: var(--bg); color: var(--fg); padding-block: 8px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); max-width: 900px; }
+td, th { padding: 1px 10px 1px 0; text-align: right; font-variant-numeric: tabular-nums; }
+td:first-child, th:first-child { text-align: left; }
+th { font-weight: normal; color: var(--dim); }
+.ok { color: var(--ok); } .hold { color: var(--hold); } .stop { color: var(--stop); }
+.bid { color: var(--bid); } .ask { color: var(--ask); } .dim { color: var(--dim); }
+svg { width: 100%; height: auto; display: block; }
+.wide { overflow-x: auto; }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 16px; }
+.charts > div { min-width: 0; cursor: pointer; }
+.charts > div.sel b { text-decoration: underline; }
+.charts > div:focus-visible { outline: 2px solid var(--fg); }
+.fair { stroke: var(--fg); }
+</style>
+
+<p><b id="status" role="status" aria-live="polite">CONNECTING</b> <span id="why"></span><br>
+<span id="clock"></span> &nbsp; <span id="next"></span> &nbsp; <span id="high"></span><br>
+<span id="fresh"></span> &nbsp; <span id="check"></span></p>
+
+<p class="dim">Last hour, fair value each minute; <span class="bid">our best bid</span>, <span class="ask">our best ask</span>; ▲ we sold, ▼ we bought; shaded: no quotes. Click a chart to break down its quotes.</p>
+<div class="charts" id="charts"></div>
+<p id="build"></p>
+
+<div class="wide"><table>
+  <thead><tr><th>Bin</th><th>Fair</th><th>Market</th><th>Our bid</th><th>Our ask</th><th>Held</th></tr></thead>
+  <tbody id="bins"></tbody>
+</table></div>
+
+<p id="nums"></p>
+
+<div class="wide"><table>
+  <thead><tr><th>Fill</th><th>Bin</th><th>Side</th><th>Price</th><th>Edge</th></tr></thead>
+  <tbody id="fills"></tbody>
+</table></div>
+
+<script>
+(() => {
+  'use strict';
+  // read-only view of the live trader: polls /state; times in the market's local time
+  const POLL = 5000, SPAN = 60;   // chart span in minutes
+  const ZONES = { KXHIGHNY: 'America/New_York' };
+  const STATIONS = { KXHIGHNY: 'Central Park' };
+  const $ = (id) => document.getElementById(id);
+  let data = null, fetchedAt = 0, offset = 0, failed = null, sel = null;
+
+  const zone = () => ZONES[data?.state?.series] || 'America/New_York';
+  const hm = (t, secs) => new Intl.DateTimeFormat('en-US', { timeZone: zone(), hour: '2-digit', minute: '2-digit', ...(secs ? { second: '2-digit' } : {}), hourCycle: 'h23' }).format(new Date(t * 1000));
+  const tzName = (t) => new Intl.DateTimeFormat('en-US', { timeZone: zone(), timeZoneName: 'short' }).formatToParts(new Date(t * 1000)).find((p) => p.type === 'timeZoneName')?.value || '';
+  const money = (x) => (x < 0 ? '−$' : '$') + Math.abs(x).toFixed(2);
+  const signed = (x, d) => (x > 0 ? '+' : x < 0 ? '−' : '') + Math.abs(x).toFixed(d);
+  const pad = (n) => String(n).padStart(2, '0');
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const label = ([lo, hi]) => lo == null ? `≤${hi}°F` : hi == null ? `≥${lo}°F` : `${lo}–${hi}°F`;
+  const now = () => Date.now() / 1000 + offset;   // the server's clock
+
+  async function poll() {
+    try {
+      const r = await fetch('/state', { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      data = await r.json(); fetchedAt = Date.now(); offset = data.server_time - Date.now() / 1000; failed = null;
+    } catch (e) { failed = e.message || 'no answer'; }
+    render();
+  }
+
+  function rowsOf(event) { return (data.history || []).filter((r) => r.event === event); }
+  function fillsOf(event) {   // fills in the minute rows, newest first, deduplicated
+    const seen = new Map();
+    for (const r of [...rowsOf(event), data.state]) for (const f of r?.last_fills || []) seen.set(`${f.t}|${f.k}|${f.side}|${f.cents}|${f.n}`, f);
+    return [...seen.values()].sort((a, b) => b.t - a.t);
+  }
+  function fairAt(rows, t, k) {   // fair value (cents) at the fill's decision minute
+    let best = null;
+    for (const r of rows) if (r.t <= t && r.fair) best = 100 * r.fair[k];
+    return best;
+  }
+
+  function chart(k, rows, fills, name) {
+    const W = 360, H = 150, L = 28, R = 4, T = 6, B = 16, end = Math.floor(now() / 60) * 60, t0 = end - (SPAN - 1) * 60;
+    rows = rows.filter((r) => r.t >= t0);
+    if (!rows.length) return '<p class="dim">No minutes recorded in the last hour.</p>';
+    const cw = (W - L - R) / SPAN, x = (t) => L + ((t - t0) / 60 + 0.5) * cw;
+    const val = (r, key) => key === 'fair' ? (r.fair ? 100 * r.fair[k] : null) : (r[key] ? r[key][k] : null);
+    const vals = rows.flatMap((r) => [val(r, 'fair'), val(r, 'best_bid'), val(r, 'best_ask')]).filter((v) => v != null);
+    if (!vals.length) return '<p class="dim">No prices in the last hour.</p>';
+    let lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1); if (hi - lo < 6) { lo -= 3; hi += 3; }
+    const y = (v) => T + (hi - v) * (H - T - B) / (hi - lo);
+    let g = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(name)}: fair value and our quotes, last hour">`;
+    rows.forEach((r) => { if (r.status !== 'QUOTING') g += `<rect x="${x(r.t) - cw / 2}" y="${T}" width="${cw}" height="${H - T - B}" fill="var(--shade)"/>`; });
+    const step = Math.max(1, Math.round((hi - lo) / 4));
+    for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) g += `<text x="${L - 3}" y="${y(v) + 3}" font-size="10" text-anchor="end" fill="var(--dim)">${v}</text><line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--shade)"/>`;
+    for (let t = Math.ceil(t0 / 1800) * 1800; t <= end; t += 1800) g += `<text x="${x(t)}" y="${H - 3}" font-size="10" text-anchor="middle" fill="var(--dim)">${hm(t)}</text>`;
+    const steps = (key, color) => {   // quotes as steps, one per minute
+      let d = '', pen = false, last = null;
+      rows.forEach((r) => {
+        const v = val(r, key);
+        if (v == null || (last != null && r.t - last > 90)) pen = false;
+        last = r.t; if (v == null) return;
+        d += pen ? `V${y(v)}H${x(r.t) + cw / 2}` : `M${x(r.t) - cw / 2},${y(v)}H${x(r.t) + cw / 2}`; pen = true;
+      });
+      return d ? `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.5"/>` : '';
+    };
+    g += steps('best_bid', 'var(--bid)') + steps('best_ask', 'var(--ask)');
+    let d = '', pen = false, last = null;   // fair value, one point per minute
+    rows.forEach((r) => {
+      const v = val(r, 'fair');
+      if (v == null || (last != null && r.t - last > 90)) pen = false;
+      last = r.t; if (v == null) return;
+      d += `${pen ? 'L' : 'M'}${x(r.t)},${y(v)}`; pen = true;
+    });
+    if (d) g += `<path d="${d}" fill="none" class="fair" stroke-width="1.2"/>`;
+    rows.forEach((r) => { const v = val(r, 'fair'); if (v != null) g += `<circle cx="${x(r.t)}" cy="${y(v)}" r="1.4" fill="var(--fg)"/>`; });
+    fills.filter((f) => f.k === k && f.t >= t0).forEach((f) => {
+      const cx = x(Math.floor(f.t / 60) * 60), cy = y(f.cents);
+      g += f.side > 0 ? `<path d="M${cx - 3},${cy + 2}L${cx + 3},${cy + 2}L${cx},${cy - 3}Z" fill="var(--ask)"/>` : `<path d="M${cx - 3},${cy - 2}L${cx + 3},${cy - 2}L${cx},${cy + 3}Z" fill="var(--bid)"/>`;
+    });
+    return g + '</svg>';
+  }
+
+  function render() {
+    const st = $('status'), fresh = $('fresh');
+    if (!data) { st.className = 'stop'; st.textContent = failed ? 'NO CONNECTION' : 'CONNECTING'; $('why').textContent = failed ? `The dashboard server did not answer (${failed}).` : ''; return; }
+    const s = data.state || {}, status = data.status || {}, t = now();
+    const shown = data.stopped && s.status !== 'STOPPED' ? 'STOPPED' : (s.status || status.status || 'NO STATE');
+    st.className = shown === 'QUOTING' ? 'ok' : shown === 'PULLED' || shown === 'PAUSED' || shown === 'IDLE' ? 'hold' : 'stop';
+    st.textContent = shown + (s.env === 'demo' ? ' (demo exchange)' : '');
+    $('why').textContent = data.stopped && s.status !== 'STOPPED' ? 'STOP file set: quoting stops at the next minute.' : (s.why || (shown === 'PULLED' ? 'Calendar window: no quotes.' : ''));
+
+    const age = status.t ? Math.max(0, Math.round(t - status.t)) : null;
+    if (failed) { fresh.className = 'stop'; fresh.textContent = `DISCONNECTED: no answer from the dashboard server (${failed}) for ${Math.round((Date.now() - fetchedAt) / 1000)} s`; }
+    else if (age == null) { fresh.className = 'hold'; fresh.textContent = 'The trader has written no status yet'; }
+    else { fresh.className = age < 75 ? '' : age < 120 ? 'hold' : 'stop'; fresh.textContent = age < 75 ? `Trader updated ${age} s ago` : `STALE: the trader last wrote ${age} s ago` + (age >= 120 ? ' (the watchdog stops it after 120 s)' : ''); }
+
+    $('clock').textContent = `${hm(t, true)} ${tzName(t)}`;
+    if (s.next_window && s.status !== 'STOPPED') {
+      const left = Math.max(0, Math.round(s.next_window - t));
+      $('next').textContent = shown === 'PULLED' ? 'calendar window open' : `next calendar window ${hm(s.next_window)} (in ${Math.floor(left / 60)}:${pad(left % 60)})`;
+    } else $('next').textContent = '';
+    $('high').textContent = s.high_so_far != null ? `${STATIONS[s.series] || 'Station'} high so far ${s.high_so_far}°F` + (s.guard && s.guard !== 'ok' ? ` (${s.guard})` : '') : (s.guard && s.guard !== 'ok' ? `guard ${s.guard}` : '');
+    $('check').innerHTML = s.mismatch ? `<span class="stop">Kalshi check: ${Object.entries(s.mismatch).map(([tk, [mine, theirs]]) => `${esc(tk)} held ${signed(mine, 0)} here, ${signed(theirs, 0)} at Kalshi`).join('; ')}</span>`
+      : s.q ? 'Kalshi check: positions match ✓' : '';
+
+    if (!s.bounds || !s.fair) {   // no event under way, or stopped before reading the market
+      $('charts').innerHTML = ''; $('build').textContent = ''; $('bins').innerHTML = ''; $('nums').textContent = ''; $('fills').innerHTML = ''; return;
+    }
+    const names = s.bounds.map(label), K = names.length, rows = rowsOf(s.event), fills = fillsOf(s.event);
+    if (sel == null || sel >= K) sel = s.fair.indexOf(Math.max(...s.fair));
+    const ruled = s.ruled || Array(K).fill(false);
+    $('charts').innerHTML = names.map((b, k) => `<div data-k="${k}" role="button" tabindex="0"${k === sel ? ' class="sel"' : ''}>
+      <b>${b}</b> <span class="dim">fair ${(100 * s.fair[k]).toFixed(1)}${ruled[k] ? ', ruled out' : ''}</span>${chart(k, rows, fills, b)}</div>`).join('');
+
+    const P = s.parts && s.parts[sel], name = names[sel], ourBid = s.best_bid?.[sel], ourAsk = s.best_ask?.[sel];
+    if (!P || s.status !== 'QUOTING') $('build').textContent = `${name}: no quotes now.`;
+    else {   // the quote's parts; the posted price is the best whole cent that does not cross the market
+      const n = (x) => `(${x.toFixed(1)})`, inv = (x) => `${x >= 0 ? '+' : '−'} inventory ${n(Math.abs(x))}`;
+      const ask = P.fair + P.half + P.eps + P.own - P.lean, bid = P.fair - P.half - P.eps - P.own - P.lean;
+      $('build').innerHTML = `${name} ask <span class="ask">${ourAsk ?? '–'}¢</span> = fair ${n(P.fair)} + 1/κ ${n(P.half)} + ε ${n(P.eps)} + own risk ${n(P.own)} ${inv(-P.lean)} = ${n(ask)}, to a whole cent<br>` +
+        `${name} bid <span class="bid">${ourBid ?? '–'}¢</span> = fair ${n(P.fair)} − 1/κ ${n(P.half)} − ε ${n(P.eps)} − own risk ${n(P.own)} ${inv(-P.lean)} = ${n(bid)}, to a whole cent` +
+        (ruled[sel] ? ' (not posted: bin ruled out)' : '');
+    }
+
+    $('bins').innerHTML = names.map((b, k) => `<tr${ruled[k] ? ' class="dim"' : ''}><td>${b}${ruled[k] ? ' (out)' : ''}</td><td>${(100 * s.fair[k]).toFixed(1)}</td>
+      <td>${s.bid[k] || '–'}/${s.ask[k] < 100 ? s.ask[k] : '–'}</td><td class="bid">${s.best_bid?.[k] ?? '–'}</td><td class="ask">${s.best_ask?.[k] ?? '–'}</td>
+      <td>${s.q[k] ? signed(s.q[k], 0) : '0'}</td></tr>`).join('');
+
+    const lim = s.limits || {}, largest = Math.max(...s.q.map(Math.abs));
+    $('nums').innerHTML = `Today: <b class="${s.mark >= 0 ? 'ok' : 'stop'}">${money(s.mark)}</b> &nbsp; Daily loss limit: ${lim.loss != null ? money(lim.loss) : '–'} &nbsp;
+      Worst case at settlement: ${money(s.worst)}${s.balance != null ? ` (balance ${money(s.balance)})` : ''} &nbsp; Largest position: ${largest} / ${lim.q_max ?? '–'} &nbsp; Fills today: ${s.fills_today ?? 0}`;
+
+    $('fills').innerHTML = fills.slice(0, 5).map((f) => {
+      const fair = fairAt(rows, f.t, f.k), edge = fair == null ? null : f.side * (f.cents - fair);
+      return `<tr><td>${hm(f.t, true)}</td><td>${names[f.k]}</td><td class="${f.side > 0 ? 'ask' : 'bid'}">${f.side > 0 ? 'sold' : 'bought'} ${f.n}</td>
+        <td>${f.cents}¢</td><td class="${edge == null ? 'dim' : edge >= 0 ? 'ok' : 'stop'}">${edge == null ? '–' : signed(edge, 1) + '¢'}</td></tr>`;
+    }).join('') || '<tr><td colspan="5">No fills yet.</td></tr>';
+  }
+
+  const choose = (e) => { const el = e.target.closest('[data-k]'); if (el) { sel = +el.dataset.k; render(); } };
+  $('charts').addEventListener('click', choose);
+  $('charts').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(e); } });
+  poll(); setInterval(poll, POLL); setInterval(render, 1000);
+})();
+</script>

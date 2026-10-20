@@ -1,0 +1,12 @@
+# Downloaded data, replay output and trader state never go in the repository.
+/data/
+/output/
+/state/
+.venv/
+__pycache__/
+*.pyc
+dist/
+# Keys and local settings
+*.pem
+*_key_id
+.env
