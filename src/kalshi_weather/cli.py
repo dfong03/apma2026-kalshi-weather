@@ -1,4 +1,4 @@
-"""Command line: download data, replay, refit, record books, trade, serve the dashboard, check keys."""
+"""Command line: download data, replay, refit, check the market, record books, trade, serve the dashboard, check keys."""
 import argparse
 import json
 import numpy as np
@@ -49,6 +49,12 @@ def download(args):
     else:data.summary_messages(int(args.first[:4]), int(args.last[:4]), 'NYC', args.data)
 
 
+def check(args):
+    from . import checks
+    first, last = period(args.period)
+    print(json.dumps({series: getattr(checks, args.what)(series, first, last, args.data) for series in args.series}, indent=1))
+
+
 def record(args):
     from .recorder import record as run
     print('recording', args.series, 'every', args.interval, 'seconds to', args.data, flush=True)
@@ -86,6 +92,9 @@ def main(argv=None):
     p = sub.add_parser('estimate', help='refit fill rates and the adverse-selection term')
     p.add_argument('--series', nargs='*', default=SERIES); p.add_argument('--period', default='train'); p.add_argument('--data', default='data')
     p.add_argument('--strategy', default=None, help='the prior for thin cells (default: the shipped strategy)'); p.add_argument('--out', default='strategy.json'); p.set_defaults(run=estimate)
+    p = sub.add_parser('check', help="check the market: the price's calibration, or the minutes in which its variance arrives")
+    p.add_argument('what', choices=['calibration', 'variance']); p.add_argument('--series', nargs='*', default=SERIES)
+    p.add_argument('--period', default='2025-10-01:2026-09-29', help='train, test, early, or FIRST:LAST'); p.add_argument('--data', default='data'); p.set_defaults(run=check)
     p = sub.add_parser('record', help='record live order books'); p.add_argument('series', nargs='*', default=SERIES)
     p.add_argument('--interval', type=float, default=2.); p.add_argument('--data', default='data'); p.add_argument('--seconds', type=float, default=None); p.set_defaults(run=record)
     p = sub.add_parser('trade', help='the live trader (settings from the environment)'); p.add_argument('command', choices=['run', 'kill', 'watchdog'])

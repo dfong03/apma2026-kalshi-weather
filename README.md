@@ -50,6 +50,19 @@ uv run kalshi-weather replay --strategy strategy.json
 
 This refits the fill rates, κ and ε by same-day flag and fair-value bucket. Cells with fewer than 50,000 quote-minutes keep the values of the strategy given with `--strategy` (by default, the shipped one).
 
+## Market checks
+
+Two checks on the market itself (the talk's slides 13 and 38), from the quotes alone:
+
+```
+uv run kalshi-weather download quotes 2025-10-01 2026-09-29
+uv run kalshi-weather check calibration                 # P(win) = sigma(a + b logit p), with day-resampled 95% intervals
+uv run kalshi-weather check variance --period train     # share of the price's variance by minute of the hour
+uv run kalshi-weather check variance --period test
+```
+
+On those dates: a = 0.157 (0.075 to 0.252), b = 1.160 (1.060 to 1.282), crossing the diagonal at 27¢; the minutes after the hourly report and the summary messages (:52, :53, :16, :17) hold 33% of the variance from October to March and 51% from April to September.
+
 ## Record order books
 
 ```
